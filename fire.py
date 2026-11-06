@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 from collections import deque
+from datetime import datetime
+from dotenv import load_dotenv
 import os
 import smtplib
 import ssl
@@ -8,9 +10,25 @@ import sys
 import threading
 from email.message import EmailMessage
 
+# Carga automáticamente las variables definidas en .env, si el archivo existe.
+load_dotenv()
 
-def send_fire_email():
-    """Envía un correo usando credenciales configuradas en variables de entorno."""
+LOG_FILE = "fire_alerts.log"
+_log_lock = threading.Lock()
+
+
+def log_event(message):
+    """Guarda cada evento con fecha, hora y zona horaria local."""
+    timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    line = f"{timestamp} {message}\n"
+    with _log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+            log_file.write(line)
+    print(line.rstrip())
+
+
+def send_fire_email(detected_at):
+    """Envía un correo usando credenciales configuradas en el archivo .env."""
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "465"))
     username = os.getenv("SMTP_USER")
@@ -34,7 +52,8 @@ def send_fire_email():
     message["From"] = sender
     message["To"] = recipient
     message.set_content(
-        "El detector de incendios ha confirmado una posible llama. "
+        "El detector de incendios ha confirmado una posible llama.\n"
+        f"Fecha y hora de detección: {detected_at}\n"
         "Verifica la cámara y la situación de inmediato."
     )
 
@@ -53,22 +72,33 @@ def send_fire_email():
 
 
 class EmailAlert:
-    """Envía un correo una vez al inicio de cada detección confirmada."""
+    """Registra el inicio/fin de una detección y avisa por correo una sola vez por evento."""
     def __init__(self):
         self.was_detected = False
 
     def update(self, fire_detected):
         if fire_detected and not self.was_detected:
-            threading.Thread(target=self._send, daemon=True).start()
+            detected_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+            log_event(f"ALERTA_INICIO deteccion_confirmada fecha_hora={detected_at}")
+            threading.Thread(
+                target=self._send,
+                args=(detected_at,),
+                daemon=True,
+            ).start()
+        elif self.was_detected and not fire_detected:
+            log_event("ALERTA_FIN deteccion_dejo_de_confirmarse")
+
         self.was_detected = fire_detected
 
     @staticmethod
-    def _send():
+    def _send(detected_at):
         try:
-            send_fire_email()
-            print("[ALERTA] Correo de incendio enviado.")
+            send_fire_email(detected_at)
+            log_event(f"CORREO_ENVIADO fecha_hora_deteccion={detected_at}")
         except Exception as error:
-            print(f"[ERROR] No se pudo enviar el correo de alerta: {error}")
+            log_event(
+                f"ERROR_CORREO fecha_hora_deteccion={detected_at} detalle={error}"
+            )
 
 
 def open_camera():
@@ -284,23 +314,29 @@ def generate_demo_frame(width=640, height=480, frame_index=0):
     return frame
 
 
+def run_demo():
+    print("Modo demo activado. No se envían correos en modo demo.")
+    detector = FireDetector()
+    for i in range(500):
+        frame = generate_demo_frame(frame_index=i)
+        output, color_view, motion_view, fire_detected = detector.process(frame)
+        cv2.imshow("Demo - Fuego", output)
+        cv2.imshow("Demo - Color", color_view)
+        cv2.imshow("Demo - Movimiento", motion_view)
+        if fire_detected:
+            print("[ALERTA] Fuego detectado en modo demo.")
+        if cv2.waitKey(30) & 0xFF == ord('q'):
+            break
+    cv2.destroyAllWindows()
+
+
 def main():
     camera = open_camera()
     detector = FireDetector()
 
     if camera is None:
         print("[INFO] No se encontró cámara. Ejecutando modo demostración.")
-        for i in range(500):
-            frame = generate_demo_frame(frame_index=i)
-            output, color_view, motion_view, fire_detected = detector.process(frame)
-            cv2.imshow("Demo - Fuego", output)
-            cv2.imshow("Demo - Color", color_view)
-            cv2.imshow("Demo - Movimiento", motion_view)
-            if fire_detected:
-                print("[ALERTA] Fuego detectado en modo demo.")
-            if cv2.waitKey(30) & 0xFF == ord('q'):
-                break
-        cv2.destroyAllWindows()
+        run_demo()
         return
 
     print("Sistema de detección de incendios iniciado. Presiona 'q' para salir.")
@@ -310,7 +346,7 @@ def main():
         while True:
             ret, frame = camera.read()
             if not ret or frame is None:
-                print("[ERROR] La cámara no está entregando imágenes válidas.")
+                log_event("ERROR La cámara no está entregando imágenes válidas")
                 break
 
             output, color_view, motion_view, fire_detected = detector.process(frame)
@@ -333,18 +369,6 @@ def main():
 
 if __name__ == "__main__":
     if "--demo" in sys.argv:
-        print("Modo demo activado.")
-        detector = FireDetector()
-        for i in range(500):
-            frame = generate_demo_frame(frame_index=i)
-            output, color_view, motion_view, fire_detected = detector.process(frame)
-            cv2.imshow("Demo - Fuego", output)
-            cv2.imshow("Demo - Color", color_view)
-            cv2.imshow("Demo - Movimiento", motion_view)
-            if fire_detected:
-                print("[ALERTA] Fuego detectado en modo demo.")
-            if cv2.waitKey(30) & 0xFF == ord('q'):
-                break
-        cv2.destroyAllWindows()
+        run_demo()
     else:
         main()
