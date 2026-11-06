@@ -10,7 +10,7 @@ import sys
 import threading
 from email.message import EmailMessage
 
-# Carga automáticamente las variables definidas en .env, si el archivo existe.
+# Carga automática de variables desde un archivo .env
 load_dotenv()
 
 LOG_FILE = "fire_alerts.log"
@@ -18,17 +18,17 @@ _log_lock = threading.Lock()
 
 
 def log_event(message):
-    """Guarda cada evento con fecha, hora y zona horaria local."""
+    """Guarda eventos con fecha, hora y zona horaria local."""
     timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
-    line = f"{timestamp} {message}\n"
+    entry = f"{timestamp} {message}\n"
     with _log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as log_file:
-            log_file.write(line)
-    print(line.rstrip())
+            log_file.write(entry)
+    print(entry.rstrip())
 
 
 def send_fire_email(detected_at):
-    """Envía un correo usando credenciales configuradas en el archivo .env."""
+    """Envía un correo usando credenciales configuradas en .env."""
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "465"))
     username = os.getenv("SMTP_USER")
@@ -72,7 +72,7 @@ def send_fire_email(detected_at):
 
 
 class EmailAlert:
-    """Registra el inicio/fin de una detección y avisa por correo una sola vez por evento."""
+    """Envia un correo solo cuando comienza una nueva alarma."""
     def __init__(self):
         self.was_detected = False
 
@@ -308,8 +308,7 @@ def generate_demo_frame(width=640, height=480, frame_index=0):
         x = np.int32(cx + r * np.cos(angle) * 0.5)
         y = int(cy - i * 1.5 + 20 * np.sin(frame_index * 0.3 + i * 0.18))
         for px in x:
-            py = y
-            if 0 <= px < width and 0 <= py < height:
+            if 0 <= px < width and 0 <= py := y:
                 frame[py, px] = [0, max(50, 100 + i), 255]
     return frame
 
@@ -351,6 +350,7 @@ def main():
 
             output, color_view, motion_view, fire_detected = detector.process(frame)
             email_alert.update(fire_detected)
+
             cv2.imshow("Cámara", output)
             cv2.imshow("Detección de color", color_view)
             cv2.imshow("Movimiento", motion_view)
