@@ -1,8 +1,74 @@
-
 import cv2
 import numpy as np
 from collections import deque
+import os
+import smtplib
+import ssl
 import sys
+import threading
+from email.message import EmailMessage
+
+
+def send_fire_email():
+    """Envía un correo usando credenciales configuradas en variables de entorno."""
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "465"))
+    username = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASSWORD")
+    sender = os.getenv("ALERT_FROM", username or "")
+    recipient = os.getenv("ALERT_TO")
+
+    missing = [
+        name for name, value in (
+            ("SMTP_HOST", host),
+            ("SMTP_USER", username),
+            ("SMTP_PASSWORD", password),
+            ("ALERT_TO", recipient),
+        ) if not value
+    ]
+    if missing:
+        raise ValueError("Faltan variables de entorno: " + ", ".join(missing))
+
+    message = EmailMessage()
+    message["Subject"] = "ALERTA: posible incendio detectado"
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content(
+        "El detector de incendios ha confirmado una posible llama. "
+        "Verifica la cámara y la situación de inmediato."
+    )
+
+    context = ssl.create_default_context()
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=15) as server:
+            server.login(username, password)
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(host, port, timeout=15) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(username, password)
+            server.send_message(message)
+
+
+class EmailAlert:
+    """Envía un correo una vez al inicio de cada detección confirmada."""
+    def __init__(self):
+        self.was_detected = False
+
+    def update(self, fire_detected):
+        if fire_detected and not self.was_detected:
+            threading.Thread(target=self._send, daemon=True).start()
+        self.was_detected = fire_detected
+
+    @staticmethod
+    def _send():
+        try:
+            send_fire_email()
+            print("[ALERTA] Correo de incendio enviado.")
+        except Exception as error:
+            print(f"[ERROR] No se pudo enviar el correo de alerta: {error}")
 
 
 def open_camera():
@@ -210,8 +276,9 @@ def generate_demo_frame(width=640, height=480, frame_index=0):
         angle = np.linspace(0, 2 * np.pi, 100)
         r = i * 1.2 + (frame_index % 7)
         x = np.int32(cx + r * np.cos(angle) * 0.5)
-        y = np.int32(cy - i * 1.5 + 20 * np.sin(frame_index * 0.3 + i * 0.18))
-        for px, py in zip(x, y):
+        y = int(cy - i * 1.5 + 20 * np.sin(frame_index * 0.3 + i * 0.18))
+        for px in x:
+            py = y
             if 0 <= px < width and 0 <= py < height:
                 frame[py, px] = [0, max(50, 100 + i), 255]
     return frame
@@ -237,6 +304,7 @@ def main():
         return
 
     print("Sistema de detección de incendios iniciado. Presiona 'q' para salir.")
+    email_alert = EmailAlert()
 
     try:
         while True:
@@ -246,6 +314,7 @@ def main():
                 break
 
             output, color_view, motion_view, fire_detected = detector.process(frame)
+            email_alert.update(fire_detected)
             cv2.imshow("Cámara", output)
             cv2.imshow("Detección de color", color_view)
             cv2.imshow("Movimiento", motion_view)
@@ -279,6 +348,3 @@ if __name__ == "__main__":
         cv2.destroyAllWindows()
     else:
         main()
-
-
-
