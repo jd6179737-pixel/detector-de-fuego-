@@ -3,6 +3,8 @@ import numpy as np
 from collections import deque
 from datetime import datetime
 from dotenv import load_dotenv
+from logging.handlers import RotatingFileHandler
+import logging
 import os
 import smtplib
 import ssl
@@ -10,21 +12,38 @@ import sys
 import threading
 from email.message import EmailMessage
 
-# Carga automática de variables desde un archivo .env
+
+# Carga automáticamente las variables configuradas en el archivo .env.
 load_dotenv()
 
-LOG_FILE = "fire_alerts.log"
-_log_lock = threading.Lock()
+LOG_FILE = os.getenv("LOG_FILE", "fire_alerts.log")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logger = logging.getLogger("fire_detector")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger.propagate = False
+
+if not logger.handlers:
+    formatter = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d%z %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
 
-def log_event(message):
-    """Guarda eventos con fecha, hora y zona horaria local."""
-    timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
-    entry = f"{timestamp} {message}\n"
-    with _log_lock:
-        with open(LOG_FILE, "a", encoding="utf-8") as log_file:
-            log_file.write(entry)
-    print(entry.rstrip())
+def log_event(level, message):
+    """Registra un evento con severidad y marca de tiempo en consola y archivo."""
+    logger.log(level, message)
 
 
 def send_fire_email(detected_at):
@@ -72,21 +91,24 @@ def send_fire_email(detected_at):
 
 
 class EmailAlert:
-    """Envia un correo solo cuando comienza una nueva alarma."""
+    """Envía un correo una sola vez cuando comienza una nueva alarma."""
     def __init__(self):
         self.was_detected = False
 
     def update(self, fire_detected):
         if fire_detected and not self.was_detected:
             detected_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
-            log_event(f"ALERTA_INICIO deteccion_confirmada fecha_hora={detected_at}")
+            log_event(
+                logging.CRITICAL,
+                f"ALERTA_INICIO deteccion_confirmada fecha_hora={detected_at}",
+            )
             threading.Thread(
                 target=self._send,
                 args=(detected_at,),
                 daemon=True,
             ).start()
         elif self.was_detected and not fire_detected:
-            log_event("ALERTA_FIN deteccion_dejo_de_confirmarse")
+            log_event(logging.INFO, "ALERTA_FIN deteccion_dejo_de_confirmarse")
 
         self.was_detected = fire_detected
 
@@ -94,10 +116,14 @@ class EmailAlert:
     def _send(detected_at):
         try:
             send_fire_email(detected_at)
-            log_event(f"CORREO_ENVIADO fecha_hora_deteccion={detected_at}")
+            log_event(
+                logging.INFO,
+                f"CORREO_ENVIADO fecha_hora_deteccion={detected_at}",
+            )
         except Exception as error:
             log_event(
-                f"ERROR_CORREO fecha_hora_deteccion={detected_at} detalle={error}"
+                logging.ERROR,
+                f"ERROR_CORREO fecha_hora_deteccion={detected_at} detalle={error}",
             )
 
 
@@ -114,7 +140,7 @@ def open_camera():
 
             ret, frame = cap.read()
             if ret and frame is not None and frame.size > 0:
-                print(f"[OK] Cámara encontrada: índice {index}, backend {backend}")
+                logger.info("Cámara encontrada: índice=%s backend=%s", index, backend)
                 return cap
 
             cap.release()
@@ -127,7 +153,7 @@ def open_camera():
 
         ret, frame = cap.read()
         if ret and frame is not None and frame.size > 0:
-            print(f"[OK] Cámara encontrada: índice {index}, backend por defecto")
+            logger.info("Cámara encontrada: índice=%s backend=predeterminado", index)
             return cap
 
         cap.release()
@@ -164,7 +190,6 @@ class FireDetector:
 
         lower1 = np.array([0, 60, 60], dtype=np.uint8)
         upper1 = np.array([30, 255, 255], dtype=np.uint8)
-
         lower2 = np.array([170, 60, 60], dtype=np.uint8)
         upper2 = np.array([180, 255, 255], dtype=np.uint8)
 
@@ -175,11 +200,12 @@ class FireDetector:
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
         return mask, hsv
 
     def analyze_region(self, frame, color_mask, motion_mask):
-        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         candidates = []
 
         for contour in contours:
@@ -189,29 +215,26 @@ class FireDetector:
 
             x, y, w, h = cv2.boundingRect(contour)
             box = (x, y, x + w, y + h)
-            roi_color = color_mask[y : y + h, x : x + w]
-            roi_motion = motion_mask[y : y + h, x : x + w]
-
+            roi_color = color_mask[y:y + h, x:x + w]
+            roi_motion = motion_mask[y:y + h, x:x + w]
             if roi_color.size == 0:
                 continue
 
             bbox_area = max(w * h, 1)
             color_ratio = cv2.countNonZero(roi_color) / bbox_area
             motion_ratio = cv2.countNonZero(roi_motion) / bbox_area
-
             if color_ratio < 0.04 or motion_ratio < 0.008:
                 continue
 
-            hsv = cv2.cvtColor(frame[y : y + h, x : x + w], cv2.COLOR_BGR2HSV)
-            brightness = hsv[:, :, 2]
-            fire_pixels = brightness[roi_color > 0]
-
+            roi_hsv = cv2.cvtColor(
+                frame[y:y + h, x:x + w], cv2.COLOR_BGR2HSV
+            )
+            fire_pixels = roi_hsv[:, :, 2][roi_color > 0]
             if fire_pixels.size == 0:
                 continue
 
             history = self.region_history.setdefault(box, deque(maxlen=8))
             history.append(float(np.mean(fire_pixels)))
-
             if len(history) < 4:
                 flicker_score = 0.0
             else:
@@ -223,7 +246,6 @@ class FireDetector:
             hull_area = cv2.contourArea(hull)
             solidity = area / max(hull_area, 1.0)
             irregularity = 1.0 - min(solidity, 1.0)
-
             if flicker_score < 0.01 or irregularity < 0.05:
                 continue
 
@@ -231,7 +253,6 @@ class FireDetector:
             motion_score = min(motion_ratio / 0.06, 1.0)
             flicker_score_norm = min(flicker_score / 0.10, 1.0)
             shape_score = min(irregularity / 0.30, 1.0)
-
             score = (
                 0.38 * color_score
                 + 0.30 * motion_score
@@ -253,78 +274,86 @@ class FireDetector:
         blurred = cv2.GaussianBlur(frame, (15, 15), 0)
         color_mask, _ = self.detect_fire_color(blurred)
         motion_mask, motion_ratio = self.detect_motion(blurred)
-
         candidates = self.analyze_region(frame, color_mask, motion_mask)
 
         best_box = None
         best_score = 0.0
-
-        for cand in candidates:
-            if cand["score"] > best_score:
-                best_score = cand["score"]
-                best_box = cand["box"]
+        for candidate in candidates:
+            if candidate["score"] > best_score:
+                best_score = candidate["score"]
+                best_box = candidate["box"]
 
         if best_box is not None and best_score >= 0.45:
             self.confirmed_frames += 1
         else:
             self.confirmed_frames = max(0, self.confirmed_frames - 1)
-
         fire_detected = self.confirmed_frames >= 2
 
         display = frame.copy()
         if fire_detected and best_box is not None:
             x1, y1, x2, y2 = best_box
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(display, "FUEGO DETECTADO", (x1, max(y1 - 10, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(display, f"Score: {best_score:.2f}", (x1, min(y2 + 20, display.shape[0] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            cv2.putText(
+                display, "FUEGO DETECTADO", (x1, max(y1 - 10, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+            )
+            cv2.putText(
+                display, f"Score: {best_score:.2f}",
+                (x1, min(y2 + 20, display.shape[0] - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2,
+            )
         else:
-            cv2.putText(display, "MONITOREO NORMAL", (20, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(
+                display, "MONITOREO NORMAL", (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+            )
 
-        cv2.putText(display, f"Movimiento: {motion_ratio:.3f}", (20, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(display, f"Confirmacion: {self.confirmed_frames}/2", (20, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(
+            display, f"Movimiento: {motion_ratio:.3f}", (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
+        )
+        cv2.putText(
+            display, f"Confirmacion: {self.confirmed_frames}/2", (20, 85),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+        )
 
         color_view = cv2.cvtColor(color_mask, cv2.COLOR_GRAY2BGR)
         color_view[color_mask > 0] = (0, 0, 255)
-
         motion_view = cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR)
         motion_view[motion_mask > 0] = (0, 255, 0)
-
         return display, color_view, motion_view, fire_detected
 
 
 def generate_demo_frame(width=640, height=480, frame_index=0):
-    """Genera una escena de prueba con una llama para validar el detector sin cámara."""
+    """Genera una escena de prueba con una llama para validar el detector."""
     frame = np.full((height, width, 3), 30, dtype=np.uint8)
     cx = width // 2
     cy = height // 2 + 50
+
     for i in range(1, 90):
         angle = np.linspace(0, 2 * np.pi, 100)
-        r = i * 1.2 + (frame_index % 7)
-        x = np.int32(cx + r * np.cos(angle) * 0.5)
-        y = int(cy - i * 1.5 + 20 * np.sin(frame_index * 0.3 + i * 0.18))
-        for px in x:
-            if 0 <= px < width and 0 <= py := y:
-                frame[py, px] = [0, max(50, 100 + i), 255]
+        radius = i * 1.2 + (frame_index % 7)
+        x_values = np.int32(cx + radius * np.cos(angle) * 0.5)
+        py = int(cy - i * 1.5 + 20 * np.sin(frame_index * 0.3 + i * 0.18))
+        if 0 <= py < height:
+            for px in x_values:
+                if 0 <= px < width:
+                    frame[py, px] = [0, max(50, 100 + i), 255]
     return frame
 
 
 def run_demo():
-    print("Modo demo activado. No se envían correos en modo demo.")
+    logger.info("Modo demo activado; no se envían correos en modo demo")
     detector = FireDetector()
-    for i in range(500):
-        frame = generate_demo_frame(frame_index=i)
+    for frame_index in range(500):
+        frame = generate_demo_frame(frame_index=frame_index)
         output, color_view, motion_view, fire_detected = detector.process(frame)
         cv2.imshow("Demo - Fuego", output)
         cv2.imshow("Demo - Color", color_view)
         cv2.imshow("Demo - Movimiento", motion_view)
         if fire_detected:
-            print("[ALERTA] Fuego detectado en modo demo.")
-        if cv2.waitKey(30) & 0xFF == ord('q'):
+            logger.warning("Detección de fuego en modo demo")
+        if cv2.waitKey(30) & 0xFF == ord("q"):
             break
     cv2.destroyAllWindows()
 
@@ -334,37 +363,39 @@ def main():
     detector = FireDetector()
 
     if camera is None:
-        print("[INFO] No se encontró cámara. Ejecutando modo demostración.")
+        logger.warning("No se encontró cámara; iniciando modo demostración")
         run_demo()
         return
 
-    print("Sistema de detección de incendios iniciado. Presiona 'q' para salir.")
+    logger.info("Sistema de detección iniciado; presiona 'q' para salir")
     email_alert = EmailAlert()
 
     try:
         while True:
             ret, frame = camera.read()
             if not ret or frame is None:
-                log_event("ERROR La cámara no está entregando imágenes válidas")
+                log_event(logging.ERROR, "La cámara no está entregando imágenes válidas")
                 break
 
             output, color_view, motion_view, fire_detected = detector.process(frame)
             email_alert.update(fire_detected)
-
             cv2.imshow("Cámara", output)
             cv2.imshow("Detección de color", color_view)
             cv2.imshow("Movimiento", motion_view)
 
             if fire_detected:
-                cv2.putText(output, "ALERTA: POSIBLE INCENDIO", (20, 110),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(
+                    output, "ALERTA: POSIBLE INCENDIO", (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+                )
                 cv2.imshow("Cámara", output)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
         camera.release()
         cv2.destroyAllWindows()
+        logger.info("Sistema de detección detenido")
 
 
 if __name__ == "__main__":
